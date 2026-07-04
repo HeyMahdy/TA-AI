@@ -10,6 +10,7 @@ from psycopg2.extras import execute_values
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+import pymupdf4llm
 
 from config.db import get_db_connection
 from .prompts import ENTITY_EXTRACTION_PROMPT, RELATIONSHIP_EXTRACTION_PROMPT
@@ -43,34 +44,80 @@ class StageTimer:
         print(f"[GraphRAG][timing] {self.stage}: {elapsed:.2f}s")
 
 
-def extract_text_from_file(contents: bytes, content_type: str) -> str:
-    """Extract raw text from PDF, DOCX, or TXT files."""
-    if content_type == "application/pdf":
-        pdf_reader = pypdf.PdfReader(io.BytesIO(contents))
-        text = ""
-        for page in pdf_reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-        return text.strip()
+import base64
+import pymupdf
+import pymupdf4llm
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
 
-    elif content_type in ("text/plain", "text/csv"):
-        return contents.decode("utf-8").strip()
+TEXT_THRESHOLD = 40  # chars — below this, a page is treated as "screenshot-only"
+VISION_PROMPT = (
+    "Describe this slide in detail: what boxes/shapes or diagrams it shows, "
+    "how they connect, and any labeled values, numbers, or table contents."
+)
 
-    elif content_type in (
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "application/msword"
-    ):
-        # For DOCX, try python-docx if available, otherwise treat as text
-        try:
-            import docx
-            doc = docx.Document(io.BytesIO(contents))
-            return "\n".join([p.text for p in doc.paragraphs]).strip()
-        except ImportError:
-            return contents.decode("utf-8", errors="ignore").strip()
+# Instantiate once (outside the request function) — reused across calls
+_vision_model = ChatOpenAI(model="gpt-4o", max_tokens=500)
 
-    else:
-        raise ValueError(f"Unsupported file type: {content_type}")
+
+def _describe_page_with_vision(doc: "pymupdf.Document", page_index: int) -> str:
+    """Render a single page to a PNG in memory and ask the vision model to describe it."""
+    pix = doc[page_index].get_pixmap(dpi=200)
+    img_bytes = pix.tobytes("png")
+    b64_image = base64.b64encode(img_bytes).decode("utf-8")
+
+    message = HumanMessage(
+        content=[
+            {"type": "text", "text": VISION_PROMPT},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image}"}},
+        ]
+    )
+    response = _vision_model.invoke([message])
+    return response.content
+
+
+def extract_text_from_file(contents: bytes, content_type: str) -> list[dict]:
+    """
+    Returns a list of {"page": int, "text": str, "source": "pymupdf4llm" | "vision_model"}
+    ready to chunk/embed downstream.
+    """
+    if content_type != "application/pdf":
+        raise ValueError(f"Unsupported content type: {content_type}")
+
+    doc = pymupdf.open(stream=contents, filetype="pdf")
+
+    try:
+        # STEP 1 — raw pymupdf4llm pass across the whole doc (cheap, local, fast)
+        pages = pymupdf4llm.to_markdown(
+            doc,
+            page_chunks=True,
+            embed_images=True,          # base64-embedded, no disk writes — safe for concurrent uploads
+            dpi=200,
+            table_strategy="lines_strict",
+            header=False,
+            footer=False,
+            use_ocr=True,
+        )
+
+        # STEP 2 — flag pages with little/no real embedded text
+        flagged_pages = {
+            i for i in range(doc.page_count)
+            if len(doc[i].get_text().strip()) < TEXT_THRESHOLD
+        }
+
+        # STEP 3 — route ONLY flagged pages through the vision model
+        results = []
+        for i, page_chunk in enumerate(pages):
+            if i in flagged_pages:
+                description = _describe_page_with_vision(doc, i)
+                results.append({"page": i, "text": description, "source": "vision_model"})
+            else:
+                results.append({"page": i, "text": page_chunk["text"], "source": "pymupdf4llm"})
+
+        return results
+    finally:
+        doc.close()  # always close, even if something above raises
+   
 
 
 def chunk_text(text: str) -> List[str]:
