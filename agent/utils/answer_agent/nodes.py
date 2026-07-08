@@ -8,7 +8,7 @@ from .state import AgentState
 from .tools import tools
 
 # Initialize base LLMs
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+llm = ChatOpenAI(model="gpt-5.4-mini", temperature=0)
 
 # The "Agent" LLM needs to know about the tools!
 # This is the crucial step you were missing.

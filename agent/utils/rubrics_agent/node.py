@@ -15,7 +15,7 @@ from .prompt import RUBRIC_PROMPT,system_prompt
 load_dotenv()
 
 # 1. Initialize LLMs
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+llm = ChatOpenAI(model="gpt-5.4-mini", temperature=0)
 
 # CRITICAL FIX: The saving agent MUST have tools bound to it!
 agent_llm = llm.bind_tools(tools)
