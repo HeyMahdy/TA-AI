@@ -1,8 +1,12 @@
 import re
+import os
+import json
+import httpx
 from psycopg2 import sql
 from langchain_core.tools import tool
 
 from config.db import get_db_connection
+from .prompt import SLIDES_ROADMAP_INPUT_TEMPLATE, SLIDES_DEFAULT_INPUT_TEMPLATE
 
 
 def _normalize_table_names(table_names: str) -> list[str]:
@@ -119,7 +123,167 @@ def sql_db_query(query: str) -> str:
         return f"Error: {e}"
 
 
-tools = [sql_db_list_tables, sql_db_schema, sql_db_query]
+_ROADMAP_THEME_ID = "st-1755572635794-2azplqgf7"
+_DEFAULT_THEME_ID = "st-1759917935785-nx0z6ae54"
+
+
+def _is_roadmap_request(user_prompt: str) -> bool:
+    text = (user_prompt or "").lower()
+    if "roadmap" in text:
+        return True
+
+    timeline_signals = [
+        "timeline",
+        "milestone",
+        "chronological",
+        "phases",
+        "project plan",
+        "implementation plan",
+    ]
+    return any(signal in text for signal in timeline_signals)
+
+
+def _build_slides_user_input(user_prompt: str, is_roadmap: bool) -> str:
+    raw_request = (user_prompt or "").strip()
+    template = SLIDES_ROADMAP_INPUT_TEMPLATE if is_roadmap else SLIDES_DEFAULT_INPUT_TEMPLATE
+    return template.format(user_request=raw_request)
+
+
+@tool
+def twoslides_generate_deck(user_prompt: str) -> str:
+    """
+    Generates a presentation deck using MagicSlides and returns download URL + metadata.
+    Classification selection:
+    - roadmap/timeline requests -> st-1755572635794-2azplqgf7
+    - all others -> st-1759917935785-nx0z6ae54
+    """
+    api_key = os.getenv("MAGICSLIDES_API_KEY", "").strip()
+    if not api_key:
+        return json.dumps(
+            {
+                "type": "slides_result",
+                "status": "error",
+                "httpStatus": None,
+                "error": "Missing MAGICSLIDES_API_KEY environment variable.",
+            }
+        )
+
+    is_roadmap = _is_roadmap_request(user_prompt)
+    selected_theme_id = _ROADMAP_THEME_ID if is_roadmap else _DEFAULT_THEME_ID
+    classification = "roadmap" if is_roadmap else "default"
+    enhanced_user_input = _build_slides_user_input(user_prompt, is_roadmap)
+
+    slide_count = 12 if is_roadmap else 10
+    payload = {
+        "apiKey": api_key,
+        "topic": enhanced_user_input,
+        "slideCount": slide_count,
+        "aiImages": True,
+        "model": "gpt-4",
+    }
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        response = httpx.post(
+            "https://api.magicslides.app/public/api/ppt-from-text",
+            headers=headers,
+            json=payload,
+            timeout=90.0,
+        )
+    except Exception as e:
+        return json.dumps(
+            {
+                "type": "slides_result",
+                "status": "error",
+                "httpStatus": None,
+                "error": f"Could not reach MagicSlides API. {e}",
+            }
+        )
+
+    if response.status_code != 200:
+        error_message = response.text
+        try:
+            error_json = response.json()
+            error_message = (
+                error_json.get("message")
+                or error_json.get("error")
+                or json.dumps(error_json)
+            )
+        except Exception:
+            pass
+        return json.dumps(
+            {
+                "type": "slides_result",
+                "status": "error",
+                "httpStatus": response.status_code,
+                "error": str(error_message),
+            }
+        )
+
+    try:
+        body = response.json()
+    except Exception as e:
+        return json.dumps(
+            {
+                "type": "slides_result",
+                "status": "error",
+                "httpStatus": response.status_code,
+                "error": f"MagicSlides returned non-JSON response. {e}",
+            }
+        )
+
+    if not isinstance(body, dict):
+        return json.dumps(
+            {
+                "type": "slides_result",
+                "status": "error",
+                "httpStatus": response.status_code,
+                "error": "MagicSlides returned invalid JSON structure.",
+            }
+        )
+
+    status_value = str(body.get("status", "")).lower()
+    download_url = body.get("url")
+    pdf_url = body.get("pdfUrl")
+    ppt_id = body.get("pptId")
+
+    if status_value != "success":
+        return json.dumps(
+            {
+                "type": "slides_result",
+                "status": "error",
+                "httpStatus": response.status_code,
+                "error": body.get("message") or body.get("error") or json.dumps(body),
+            }
+        )
+
+    if not download_url:
+        return json.dumps(
+            {
+                "type": "slides_result",
+                "status": "error",
+                "httpStatus": response.status_code,
+                "error": "MagicSlides response missing url.",
+            }
+        )
+
+    return json.dumps(
+        {
+            "type": "slides_result",
+            "status": "success",
+            "downloadUrl": download_url,
+            "slidePageCount": slide_count,
+            "pdfUrl": pdf_url,
+            "pptId": ppt_id,
+            "themeClassification": classification,
+            "themeId": selected_theme_id,
+            "mode": "sync",
+            "confidenceScore": "5/5",
+        }
+    )
+
+
+tools = [sql_db_list_tables, sql_db_schema, sql_db_query, twoslides_generate_deck]
 tools_by_name = {tool_item.name: tool_item for tool_item in tools}
 
 

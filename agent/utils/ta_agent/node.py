@@ -1,6 +1,6 @@
 from typing import Literal
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END
 from langgraph.prebuilt import ToolNode
@@ -15,9 +15,45 @@ model = ChatOpenAI(model="gpt-5.4-mini", temperature=0)
 list_tables_tool = next(tool for tool in tools if tool.name == "sql_db_list_tables")
 get_schema_tool = next(tool for tool in tools if tool.name == "sql_db_schema")
 run_query_tool = next(tool for tool in tools if tool.name == "sql_db_query")
+slides_tool = next(tool for tool in tools if tool.name == "twoslides_generate_deck")
 
 get_schema_node = ToolNode([get_schema_tool], name="get_schema")
 run_query_node = ToolNode([run_query_tool], name="run_query")
+
+
+def _latest_user_message_text(state: AgentState) -> str:
+    for msg in reversed(state.get("messages", [])):
+        if isinstance(msg, HumanMessage):
+            return str(msg.content or "")
+    return ""
+
+
+def route_request(state: AgentState) -> Literal["call_slides_agent", "list_tables"]:
+    text = _latest_user_message_text(state).lower()
+    slides_signals = ["slide", "slides", "ppt", "pptx", "presentation", "deck"]
+    if any(signal in text for signal in slides_signals):
+        return "call_slides_agent"
+    return "list_tables"
+
+
+def call_slides_agent(state: AgentState):
+    user_prompt = _latest_user_message_text(state)
+    tool_call = {
+        "name": "twoslides_generate_deck",
+        "args": {"user_prompt": user_prompt},
+        "id": "twoslides_generate",
+        "type": "tool_call",
+    }
+    tool_call_message = AIMessage(content="", tool_calls=[tool_call])
+    tool_message = slides_tool.invoke(tool_call)
+    return {"messages": [tool_call_message, tool_message]}
+
+
+def finalize_slides_answer(state: AgentState):
+    """Return tool output directly so download URL and slide count stay exact."""
+    last_message = state["messages"][-1] if state.get("messages") else None
+    content = getattr(last_message, "content", "") if last_message else ""
+    return {"messages": [AIMessage(content=str(content or ""))]}
 
 
 def list_tables(state: AgentState):
