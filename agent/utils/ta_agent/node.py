@@ -1,25 +1,94 @@
+from typing import Literal
+
+from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.graph import END
 from langgraph.prebuilt import ToolNode
 
+from .prompt import GENERATE_QUERY_SYSTEM_PROMPT, CHECK_QUERY_SYSTEM_PROMPT
 from .state import AgentState
-from .prompt import SYSTEM_PROMPT
 from .tools import tools
 
-# LLM with tools bound
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
-agent_llm = llm.bind_tools(tools)
 
-# Tool node for LangGraph
-tool_node = ToolNode(tools)
+model = ChatOpenAI(model="gpt-5.4-mini", temperature=0)
+
+list_tables_tool = next(tool for tool in tools if tool.name == "sql_db_list_tables")
+get_schema_tool = next(tool for tool in tools if tool.name == "sql_db_schema")
+run_query_tool = next(tool for tool in tools if tool.name == "sql_db_query")
+
+get_schema_node = ToolNode([get_schema_tool], name="get_schema")
+run_query_node = ToolNode([run_query_tool], name="run_query")
 
 
-def agent_node(state: AgentState):
-    """The main TA agent reasoning node. Processes messages and decides tool calls."""
-    teacher_id = state["teacher_id"]
-    system_message = SystemMessage(content=SYSTEM_PROMPT.format(teacher_id=teacher_id))
+def list_tables(state: AgentState):
+    tool_call = {
+        "name": "sql_db_list_tables",
+        "args": {},
+        "id": "sql_list_tables",
+        "type": "tool_call",
+    }
+    tool_call_message = AIMessage(content="", tool_calls=[tool_call])
+    tool_message = list_tables_tool.invoke(tool_call)
+    return {"messages": [tool_call_message, tool_message]}
 
-    messages = [system_message] + state["messages"]
-    response = agent_llm.invoke(messages)
 
+def call_get_schema(state: AgentState):
+    system_message = {
+        "role": "system",
+        "content": (
+            "From the user's question and available table list, decide relevant tables and call sql_db_schema. "
+            "Pass a comma-separated table_names string."
+        ),
+    }
+    llm_with_tools = model.bind_tools([get_schema_tool], tool_choice="any")
+    response = llm_with_tools.invoke([system_message] + state["messages"])
     return {"messages": [response]}
+
+
+def generate_query(state: AgentState):
+    teacher_id = state.get("teacher_id", "")
+    system_message = {
+        "role": "system",
+        "content": GENERATE_QUERY_SYSTEM_PROMPT.format(teacher_id=teacher_id),
+    }
+    llm_with_tools = model.bind_tools([run_query_tool])
+    response = llm_with_tools.invoke([system_message] + state["messages"])
+    return {"messages": [response]}
+
+
+def check_query(state: AgentState):
+    system_message = {
+        "role": "system",
+        "content": CHECK_QUERY_SYSTEM_PROMPT,
+    }
+    last_message = state["messages"][-1]
+    if not getattr(last_message, "tool_calls", None):
+        return {"messages": []}
+
+    tool_call = last_message.tool_calls[0]
+    user_message = {"role": "user", "content": tool_call["args"]["query"]}
+    llm_with_tools = model.bind_tools([run_query_tool], tool_choice="any")
+    response = llm_with_tools.invoke([system_message, user_message])
+    response.id = last_message.id
+    return {"messages": [response]}
+
+
+def finalize_answer(state: AgentState):
+    """Create the final natural-language answer from tool outputs without calling tools again."""
+    system_message = {
+        "role": "system",
+        "content": (
+            "You are a helpful TA assistant. Use the SQL tool results in the conversation "
+            "to answer the user's latest question clearly and concisely. "
+            "If no rows were found, say that explicitly."
+        ),
+    }
+    response = model.invoke([system_message] + state["messages"])
+    return {"messages": [response]}
+
+
+def should_continue(state: AgentState) -> Literal[END, "check_query"]:
+    last_message = state["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+        return "check_query"
+    return END

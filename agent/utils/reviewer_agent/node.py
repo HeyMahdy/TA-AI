@@ -14,13 +14,13 @@ class WeaknessOutput(BaseModel):
     comment: str = Field(description="A concise comment identifying the student's weakness or misconception for this question.")
 
 
-llm_grader_1 = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+llm_grader_1 = ChatOpenAI(model="gpt-5.4-mini", temperature=0)
 structured_grader_1 = llm_grader_1.with_structured_output(GraderOutput)
 
-llm_grader_2 = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+llm_grader_2 = ChatOpenAI(model="gpt-5.4-mini", temperature=0)
 structured_grader_2 = llm_grader_2.with_structured_output(GraderOutput)
 
-llm_weakness = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+llm_weakness = ChatOpenAI(model="gpt-5.4-mini", temperature=0.3)
 structured_weakness = llm_weakness.with_structured_output(WeaknessOutput)
 
 def _extract_rubric_max_points(rubric_description: str) -> float | None:
@@ -191,9 +191,9 @@ def aggregate_results_node(state: AssignmentState):
     g2_score = state["grader_2_result"]["score"]
     ai_comment = state.get("weakness_result", {}).get("comment", "")
 
-    # Calculate final score (average of both graders)
+    # Calculate final score (best of both graders)
     rubric_max = _extract_rubric_max_points(state.get("rubric_description", "{}"))
-    final_score = _normalize_score((g1_score + g2_score) / 2, rubric_max)
+    final_score = _normalize_score(max(g1_score, g2_score), rubric_max)
 
     # Calculate confidence based on agreement between graders
     score_diff = abs(g1_score - g2_score)

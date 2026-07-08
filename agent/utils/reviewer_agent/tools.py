@@ -42,41 +42,52 @@ def fetch_evaluation_context(teacher_id: str, student_id: str, assignment_id: in
     sql = """
         SELECT 
             sa.id AS ans_id,
-            sa.answer,
+            COALESCE(sa.answer, '') AS answer,
             q.question_description,
-            r.rubric_description,
+            COALESCE(r.rubric_description, '{}'::jsonb) AS rubric_description,
             COALESCE(ts.solution_text, '') AS teacher_solution,
             sqs.marks AS existing_marks,
             sqs.confidence_score AS existing_confidence_score,
             COALESCE(sqs.ai_comment, '') AS existing_ai_comment
-        FROM public.student_answers sa
-        JOIN public.questions q 
-            ON sa.assignment_id = q.assignment_id 
-            AND sa.question_label = q.question_label
+        FROM public.questions q
+        LEFT JOIN public.student_answers sa
+            ON sa.assignment_id = q.assignment_id
             AND sa.teacher_id = q.teacher_id
-        JOIN public.rubrics r 
-            ON sa.assignment_id = r.assignment_id 
-            AND sa.question_label = r.question_label
-            AND sa.teacher_id = r.teacher_id
+            AND sa.student_id = %s
+            AND regexp_replace(lower(sa.question_label), '\\s+', '', 'g')
+                = regexp_replace(lower(q.question_label), '\\s+', '', 'g')
+        LEFT JOIN public.rubrics r 
+            ON r.assignment_id = q.assignment_id 
+            AND r.teacher_id = q.teacher_id
+            AND regexp_replace(lower(r.question_label), '\\s+', '', 'g')
+                = regexp_replace(lower(q.question_label), '\\s+', '', 'g')
         LEFT JOIN public.teacher_solutions ts 
-            ON sa.assignment_id = ts.assignment_id 
-            AND sa.question_label = ts.question_label
-            AND sa.teacher_id = ts.teacher_id
+            ON ts.assignment_id = q.assignment_id 
+            AND ts.teacher_id = q.teacher_id
+            AND regexp_replace(lower(ts.question_label), '\\s+', '', 'g')
+                = regexp_replace(lower(q.question_label), '\\s+', '', 'g')
         LEFT JOIN public.student_question_scores sqs
-            ON sa.assignment_id = sqs.assignment_id
-            AND sa.question_label = sqs.question_label
-            AND sa.teacher_id = sqs.teacher_id
-            AND sa.student_id = sqs.student_id
-            AND sa.answer = sqs.student_solution
-        WHERE sa.teacher_id = %s 
-            AND sa.student_id = %s 
-            AND sa.assignment_id = %s 
-            AND sa.question_label = %s;
+            ON sqs.assignment_id = q.assignment_id
+            AND sqs.teacher_id = q.teacher_id
+            AND sqs.student_id = %s
+            AND regexp_replace(lower(sqs.question_label), '\\s+', '', 'g')
+                = regexp_replace(lower(q.question_label), '\\s+', '', 'g')
+            AND (
+                sa.answer IS NULL
+                OR sqs.student_solution IS NULL
+                OR sa.answer = sqs.student_solution
+            )
+        WHERE q.teacher_id = %s 
+            AND q.assignment_id = %s 
+            AND regexp_replace(lower(q.question_label), '\\s+', '', 'g')
+                = regexp_replace(lower(%s), '\\s+', '', 'g')
+        ORDER BY sa.created_at DESC NULLS LAST, sqs.updated_at DESC NULLS LAST
+        LIMIT 1;
     """
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (teacher_id, student_id, assignment_id, question_label))
+                cur.execute(sql, (student_id, student_id, teacher_id, assignment_id, question_label))
                 row = cur.fetchone()
                 if not row:
                     return json.dumps({"error": f"No matching data found for label '{question_label}'."})
@@ -107,24 +118,49 @@ class SaveScoreInput(BaseModel):
 @tool("save_student_score", args_schema=SaveScoreInput)
 def save_student_score(teacher_id: str, student_id: str, assignment_id: int, question_label: str, student_solution: str, marks: float, confidence_score: float, ai_comment: str = "") -> str:
     """Saves or updates the student's score for a question in student_question_scores table."""
-    sql = """
+    update_sql = """
+        UPDATE public.student_question_scores
+        SET
+            marks = %s,
+            confidence_score = %s,
+            student_solution = %s,
+            ai_comment = %s,
+            updated_at = now()
+        WHERE id = (
+            SELECT id
+            FROM public.student_question_scores
+            WHERE teacher_id = %s
+              AND student_id = %s
+              AND assignment_id = %s
+              AND regexp_replace(lower(question_label), '\\s+', '', 'g')
+                    = regexp_replace(lower(%s), '\\s+', '', 'g')
+            ORDER BY updated_at DESC NULLS LAST, id DESC
+            LIMIT 1
+        )
+        RETURNING id;
+    """
+    insert_sql = """
         INSERT INTO public.student_question_scores 
             (teacher_id, student_id, assignment_id, question_label, student_solution, marks, confidence_score, ai_comment)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (assignment_id, student_id, question_label)
-        DO UPDATE SET 
-            marks = EXCLUDED.marks,
-            confidence_score = EXCLUDED.confidence_score,
-            student_solution = EXCLUDED.student_solution,
-            ai_comment = EXCLUDED.ai_comment,
-            updated_at = now()
         RETURNING id;
     """
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (teacher_id, student_id, assignment_id, question_label, student_solution, marks, confidence_score, ai_comment))
-                new_id = cur.fetchone()['id']
+                cur.execute(
+                    update_sql,
+                    (marks, confidence_score, student_solution, ai_comment, teacher_id, student_id, assignment_id, question_label)
+                )
+                row = cur.fetchone()
+                if row:
+                    new_id = row['id']
+                else:
+                    cur.execute(
+                        insert_sql,
+                        (teacher_id, student_id, assignment_id, question_label, student_solution, marks, confidence_score, ai_comment)
+                    )
+                    new_id = cur.fetchone()['id']
                 conn.commit()
         print(f"[save_student_score] Saved score for {question_label} (id={new_id})")
         return f"Successfully saved score for '{question_label}'. ID: {new_id}"
